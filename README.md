@@ -8,10 +8,12 @@ blanche en plateau imprimable en 3D avec leurs empreintes (alternative à Tool T
 1. Posez les objets sur une feuille blanche (A4 par défaut), sur un fond plus sombre.
 2. Photographiez **du dessus**, feuille entière visible, de préférence de loin avec zoom
    (moins de perspective) et en lumière diffuse (pas d'ombres portées).
-3. Lancez `tracetiroir.exe`, ouvrez ou glissez-déposez la photo.
+3. Lancez `tracetiroir.exe`, ouvrez ou glissez-déposez la photo (dans la fenêtre ou sur l'exécutable).
    - **Onglet 1** : vérifiez/ajustez les 4 coins de la feuille.
-   - **Onglet 2** : contours détectés (rouge). Cliquez pour ajouter des encoches de préhension,
-     ou passez en mode « ignorer objet » pour exclure un élément.
+   - **Onglet 2** : objets détectés (teinte bleue, contour orange, numérotés). Cliquez pour ajouter
+     des encoches de préhension, ou passez en mode « Ignorer un objet » pour exclure un élément.
+   - **Plateau** (panneau de gauche) : profondeur par défaut, profondeur propre à chaque objet
+     numéroté, dimensions imposées. Chaque réglage a une infobulle explicative.
    - **Onglet 3** : aperçu 3D (glisser pour tourner).
 4. Exportez en **STL** (impression), **SVG** ou **DXF** (découpe laser / CNC / mousse).
 
