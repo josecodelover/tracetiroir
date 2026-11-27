@@ -141,6 +141,9 @@ pub struct App {
     brush_mm: f64,
     /// Un trait de pinceau est en cours.
     painting: bool,
+    /// Zoom / déplacement de la vue Photo et de la vue Contours.
+    photo_zoom: ZoomView,
+    contour_zoom: ZoomView,
 }
 
 impl App {
@@ -168,6 +171,8 @@ impl App {
             hover_obj: None,
             brush_mm: 4.0,
             painting: false,
+            photo_zoom: ZoomView::default(),
+            contour_zoom: ZoomView::default(),
         }
     }
 
@@ -191,6 +196,8 @@ impl App {
                 self.file_name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
                 self.process(ctx);
                 self.tab = Tab::Contours;
+                self.photo_zoom = ZoomView::default();
+                self.contour_zoom = ZoomView::default();
             }
             Err(e) => self.status = format!("Erreur d'ouverture : {e}"),
         }
@@ -519,14 +526,17 @@ impl App {
 
     fn photo_view(&mut self, ui: &mut egui::Ui) {
         let (Some(p), Some(tex)) = (self.project.as_mut(), self.photo_tex.as_ref()) else { return };
-        hint(ui, "Faites glisser les 4 poignées sur les coins de la feuille. Le calcul se relance au relâchement.");
+        ui.horizontal(|ui| {
+            hint(ui, "Faites glisser les 4 poignées sur les coins de la feuille. Le calcul se relance au relâchement.");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.photo_zoom.bar(ui));
+        });
         let (iw, ih) = (p.photo.width() as f32, p.photo.height() as f32);
-        let (rect, resp) = fit_rect(ui, iw, ih, Sense::click_and_drag());
+        let (view, rect, resp, panning) = self.photo_zoom.show(ui, iw, ih);
         let sc = rect.width() / iw;
         let to_screen = |q: P2| Pos2::new(rect.min.x + q[0] as f32 * sc, rect.min.y + q[1] as f32 * sc);
-        let painter = ui.painter_at(rect);
+        let painter = ui.painter_at(view);
         painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        if resp.drag_started() {
+        if resp.drag_started_by(egui::PointerButton::Primary) && !panning {
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.drag_corner = (0..4)
                     .map(|i| (i, to_screen(p.corners[i]).distance(pos)))
@@ -566,6 +576,7 @@ impl App {
         if hover.is_some_and(|h| pts.iter().any(|q| h.distance(*q) < 30.0)) || self.drag_corner.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
+        ZoomView::pan_cursor(ui, &resp, panning);
     }
 
     fn contour_view(&mut self, ui: &mut egui::Ui) {
@@ -586,6 +597,7 @@ impl App {
             legend(ui, Color32::from_rgb(230, 70, 70), "ignoré");
             legend(ui, ACCENT_DARK, "contour");
             legend(ui, Color32::from_rgb(60, 160, 255), "encoche");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.contour_zoom.bar(ui));
         });
         ui.label(
             RichText::new(match self.click {
@@ -635,9 +647,9 @@ impl App {
         let (Some(p), Some(tex)) = (self.project.as_mut(), self.rect_tex.as_ref()) else { return };
         let ppm = self.applied.ppm;
         let [tw, th] = tex.size();
-        let (rect, resp) = fit_rect(ui, tw as f32, th as f32, Sense::click_and_drag());
+        let (view, rect, resp, panning) = self.contour_zoom.show(ui, tw as f32, th as f32);
         let sc = rect.width() / tw as f32 * ppm as f32; // pixels écran par mm
-        let painter = ui.painter_at(rect);
+        let painter = ui.painter_at(view);
         painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         let to_screen = |q: P2| Pos2::new(rect.min.x + q[0] as f32 * sc, rect.min.y + q[1] as f32 * sc);
         if let Some(o) = &p.outline {
@@ -697,13 +709,13 @@ impl App {
                 }
             }
         }
-        if brush {
+        if brush && !panning {
             if let Some(h) = resp.hover_pos() {
                 let col = if self.click == ClickMode::Add { Color32::from_rgb(70, 200, 120) } else { Color32::from_rgb(235, 80, 80) };
                 painter.circle_stroke(h, (self.brush_mm * 0.5) as f32 * sc, Stroke::new(1.5, col));
             }
         }
-        if resp.hovered() {
+        if resp.hovered() && !panning {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             if self.click == ClickMode::Notch {
                 if let Some(h) = resp.hover_pos() {
@@ -712,8 +724,9 @@ impl App {
             }
         }
         let to_mm = |pos: Pos2| -> P2 { [((pos.x - rect.min.x) / sc) as f64, ((pos.y - rect.min.y) / sc) as f64] };
+        ZoomView::pan_cursor(ui, &resp, panning);
         let mut changed = false;
-        if brush {
+        if brush && (!panning || self.painting) {
             let add = self.click == ClickMode::Add;
             let radius_mm = self.brush_mm * 0.5;
             if resp.drag_started_by(egui::PointerButton::Primary) {
@@ -749,7 +762,7 @@ impl App {
             self.dirty = true;
             self.last_change = Instant::now() - Duration::from_secs(1);
         }
-        if !brush && resp.clicked() {
+        if !brush && !panning && resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let q = to_mm(pos);
                 match self.click {
@@ -771,7 +784,7 @@ impl App {
                 self.last_change = Instant::now() - Duration::from_secs(1);
             }
         }
-        if self.click == ClickMode::Notch && resp.secondary_clicked() {
+        if self.click == ClickMode::Notch && !panning && resp.secondary_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let q = to_mm(pos);
                 let near = p
@@ -1065,12 +1078,91 @@ fn overlay_image(p: &Project) -> ColorImage {
     ColorImage::from_rgb([seg.w, seg.h], &px)
 }
 
-/// Réserve un rectangle à l'échelle de l'image, centré dans l'espace disponible.
-fn fit_rect(ui: &mut egui::Ui, iw: f32, ih: f32, sense: Sense) -> (Rect, egui::Response) {
-    let avail = ui.available_size();
-    let sc = (avail.x / iw).min(avail.y / ih).max(0.01);
-    let size = Vec2::new(iw * sc, ih * sc);
-    ui.vertical_centered(|ui| ui.allocate_exact_size(size, sense)).inner
+/// Zoom et déplacement d'une image dans l'espace disponible.
+/// Molette (ou Ctrl+molette, pincement) : zoom centré sur la souris.
+/// Bouton du milieu, ou Espace + clic gauche, glissé : déplacement. Double-clic milieu : ajuster.
+#[derive(Clone, Copy)]
+struct ZoomView {
+    zoom: f32,
+    /// Décalage du centre de l'image par rapport au centre de la vue (pixels écran).
+    pan: Vec2,
+    /// Zoom demandé par les boutons, appliqué au prochain affichage (centre de la vue).
+    pending: f32,
+}
+
+impl Default for ZoomView {
+    fn default() -> Self {
+        Self { zoom: 1.0, pan: Vec2::ZERO, pending: 1.0 }
+    }
+}
+
+const ZOOM_MAX: f32 = 24.0;
+
+impl ZoomView {
+    fn zoom_at(&mut self, view: Rect, at: Pos2, factor: f32) {
+        let nz = (self.zoom * factor).clamp(1.0, ZOOM_MAX);
+        let c = view.center() + self.pan;
+        // Le point de l'image sous `at` reste sous `at`.
+        self.pan = (c - at) * (nz / self.zoom) + at.to_vec2() - view.center().to_vec2();
+        self.zoom = nz;
+    }
+
+    /// Boutons − / % / + / Ajuster (à placer dans une rangée de droite à gauche).
+    fn bar(&mut self, ui: &mut egui::Ui) {
+        let tip = "Molette : zoom à l'endroit de la souris.\nBouton du milieu (ou Espace + clic gauche) glissé : déplacer la vue.\nDouble-clic du milieu : vue entière.";
+        if ui.add_enabled(self.zoom > 1.0, egui::Button::new("Ajuster")).on_hover_text("Revenir à la feuille entière.").clicked() {
+            *self = Self::default();
+        }
+        if ui.button(" + ").on_hover_text(tip).clicked() {
+            self.pending *= 1.5;
+        }
+        ui.label(RichText::new(format!("{:.0} %", self.zoom * 100.0)).color(MUTED)).on_hover_text(tip);
+        if ui.add_enabled(self.zoom > 1.0, egui::Button::new(" − ")).on_hover_text(tip).clicked() {
+            self.pending /= 1.5;
+        }
+        ui.label(RichText::new("🔍").color(MUTED)).on_hover_text(tip);
+    }
+
+    /// Réserve la vue, gère zoom et déplacement. Retourne (vue, rectangle de l'image à l'écran,
+    /// réponse, déplacement en cours/possible : les clics ne doivent alors pas agir sur l'image).
+    fn show(&mut self, ui: &mut egui::Ui, iw: f32, ih: f32) -> (Rect, Rect, egui::Response, bool) {
+        let size = ui.available_size().max(Vec2::splat(10.0));
+        let (view, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        if self.pending != 1.0 {
+            let f = self.pending;
+            self.pending = 1.0;
+            self.zoom_at(view, view.center(), f);
+        }
+        if let Some(h) = resp.hover_pos() {
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y + i.smooth_scroll_delta.x, i.zoom_delta()));
+            let f = (scroll * 0.002).exp() * pinch;
+            if (f - 1.0).abs() > 1e-4 {
+                self.zoom_at(view, h, f);
+            }
+        }
+        if resp.double_clicked_by(egui::PointerButton::Middle) {
+            *self = Self::default();
+        }
+        let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let mut panning = space && resp.hovered() || resp.dragged_by(egui::PointerButton::Middle);
+        if resp.dragged_by(egui::PointerButton::Middle) || (space && resp.dragged_by(egui::PointerButton::Primary)) {
+            self.pan += resp.drag_delta();
+            panning = true;
+        }
+        let base = (view.width() / iw).min(view.height() / ih).max(0.001);
+        let img = Vec2::new(iw, ih) * base * self.zoom;
+        // L'image ne peut pas sortir de la vue plus que nécessaire.
+        let lim = ((img - view.size()) * 0.5).max(Vec2::ZERO);
+        self.pan = self.pan.clamp(-lim, lim);
+        (view, Rect::from_center_size(view.center() + self.pan, img), resp, panning)
+    }
+
+    fn pan_cursor(ui: &egui::Ui, resp: &egui::Response, panning: bool) {
+        if panning && (resp.hovered() || resp.dragged()) {
+            let held = resp.dragged();
+            ui.ctx().set_cursor_icon(if held { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        }
+    }
 }
 
 impl eframe::App for App {

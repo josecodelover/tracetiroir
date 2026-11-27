@@ -14,6 +14,8 @@ blanche en plateau imprimable en 3D avec leurs empreintes (alternative à Tool T
      des encoches de préhension, ou passez en mode « Ignorer » pour exclure un élément.
      Les outils **Ajouter** / **Gommer** corrigent la détection au pinceau (bout manquant, ombre
      prise pour un objet, objets collés à séparer) ; Ctrl+Z annule le dernier trait.
+   - **Zoom** (onglets 1 et 2) : molette à l'endroit de la souris, bouton du milieu ou Espace + glisser
+     pour déplacer la vue, « Ajuster » ou double-clic du milieu pour revoir la feuille entière.
    - **Plateau** (panneau de gauche) : profondeur par défaut, profondeur propre à chaque objet
      numéroté, dimensions imposées. Chaque réglage a une infobulle explicative.
    - **Onglet 3** : aperçu 3D (glisser pour tourner).
