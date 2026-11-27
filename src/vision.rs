@@ -360,7 +360,71 @@ fn background(gray: &[f32], w: usize, h: usize, ppm: f64, radius_mm: f64) -> imp
     }
 }
 
+/// Retouche manuelle du masque des objets : trait de pinceau (mm, repère feuille, y vers le bas).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrushStroke {
+    /// Vrai : ajoute de la matière à l'objet ; faux : en retire.
+    pub add: bool,
+    /// Rayon du pinceau (mm).
+    pub radius_mm: f64,
+    pub pts: Vec<P2>,
+}
+
+/// Peint un trait (suite de segments à bouts ronds) dans le masque.
+fn paint_stroke(mask: &mut [bool], w: usize, h: usize, ppm: f64, s: &BrushStroke) {
+    if s.pts.is_empty() {
+        return;
+    }
+    let r = (s.radius_mm * ppm).max(0.5);
+    let px: Vec<P2> = s.pts.iter().map(|q| [q[0] * ppm, q[1] * ppm]).collect();
+    let segs: Vec<(P2, P2)> = if px.len() == 1 { vec![(px[0], px[0])] } else { px.windows(2).map(|w| (w[0], w[1])).collect() };
+    for (a, b) in segs {
+        let x0 = (a[0].min(b[0]) - r).floor().max(0.0) as usize;
+        let y0 = (a[1].min(b[1]) - r).floor().max(0.0) as usize;
+        let x1 = ((a[0].max(b[0]) + r).ceil().max(0.0) as usize).min(w.saturating_sub(1));
+        let y1 = ((a[1].max(b[1]) + r).ceil().max(0.0) as usize).min(h.saturating_sub(1));
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = dx * dx + dy * dy;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+                let t = if len2 > 0.0 { (((fx - a[0]) * dx + (fy - a[1]) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+                let (ex, ey) = (fx - a[0] - t * dx, fy - a[1] - t * dy);
+                if ex * ex + ey * ey <= r * r {
+                    mask[y * w + x] = s.add;
+                }
+            }
+        }
+    }
+}
+
+/// Applique les retouches dans l'ordre où elles ont été faites. Les zones fermées par un
+/// trait d'ajout sont remplies si `fill` est vrai (un contour tracé à la main devient plein).
+pub fn apply_strokes(mask: &mut [bool], w: usize, h: usize, ppm: f64, strokes: &[BrushStroke], fill: bool) {
+    if strokes.is_empty() {
+        return;
+    }
+    for s in strokes {
+        paint_stroke(mask, w, h, ppm, s);
+    }
+    if fill && strokes.iter().any(|s| s.add) {
+        fill_holes(mask, w, h);
+        // Les retraits restent prioritaires : un trou gommé ne doit pas être rebouché.
+        for s in strokes.iter().filter(|s| !s.add) {
+            paint_stroke(mask, w, h, ppm, s);
+        }
+    }
+}
+
+/// Détection complète, sans retouche (utilisée pour les essais).
+#[allow(dead_code)]
 pub fn segment(img: &RgbImage, ppm: f64, p: &SegParams) -> Segmentation {
+    let mask = segment_mask(img, ppm, p);
+    label_objects(&mask, img.width() as usize, img.height() as usize, ppm, p.min_area_mm2)
+}
+
+/// Masque brut des objets (étape coûteuse, mise en cache).
+pub fn segment_mask(img: &RgbImage, ppm: f64, p: &SegParams) -> Vec<bool> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let gray: Vec<f32> = img
         .pixels()
@@ -408,6 +472,11 @@ pub fn segment(img: &RgbImage, ppm: f64, p: &SegParams) -> Segmentation {
     if p.fill_holes {
         fill_holes(&mut mask, w, h);
     }
+    mask
+}
+
+/// Composantes connexes du masque → objets numérotés (les trop petits sont écartés).
+pub fn label_objects(mask: &[bool], w: usize, h: usize, ppm: f64, min_area_mm2: f64) -> Segmentation {
     // Composantes connexes
     let gimg = GrayImage::from_fn(w as u32, h as u32, |x, y| Luma([if mask[y as usize * w + x as usize] { 255 } else { 0 }]));
     let lab = connected_components(&gimg, Connectivity::Eight, Luma([0u8]));
@@ -444,7 +513,7 @@ pub fn segment(img: &RgbImage, ppm: f64, p: &SegParams) -> Segmentation {
     let mut objects = Vec::new();
     for l in 1..=nlab {
         let a = area[l] as f64 * px_area;
-        if a >= p.min_area_mm2 {
+        if a >= min_area_mm2 {
             keep[l] = true;
             objects.push(ObjInfo {
                 label: l as u32,
@@ -590,4 +659,46 @@ fn chaikin(r: &[P2]) -> Vec<P2> {
         o.push([0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]]);
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(add: bool, r: f64, pts: &[P2]) -> BrushStroke {
+        BrushStroke { add, radius_mm: r, pts: pts.to_vec() }
+    }
+
+    #[test]
+    fn retouches_ajout_et_gomme() {
+        let (w, h, ppm) = (400, 300, 4.0); // 100 × 75 mm
+        let mut mask = vec![false; w * h];
+        // Rectangle de 40 × 10 mm à partir de (10, 10) mm
+        for y in 40..80 {
+            for x in 40..200 {
+                mask[y * w + x] = true;
+            }
+        }
+        let base = label_objects(&mask, w, h, ppm, 5.0);
+        assert_eq!(base.objects.len(), 1);
+
+        // Un trait de gomme vertical coupe le rectangle en deux objets.
+        let mut m = mask.clone();
+        apply_strokes(&mut m, w, h, ppm, &[stroke(false, 1.5, &[[30.0, 5.0], [30.0, 25.0]])], true);
+        assert_eq!(label_objects(&m, w, h, ppm, 5.0).objects.len(), 2);
+
+        // Un contour fermé tracé à la main devient un objet plein.
+        let mut m = mask.clone();
+        let carre = [[60.0, 40.0], [80.0, 40.0], [80.0, 60.0], [60.0, 60.0], [60.0, 40.0]];
+        apply_strokes(&mut m, w, h, ppm, &[stroke(true, 1.0, &carre)], true);
+        let seg = label_objects(&m, w, h, ppm, 5.0);
+        assert_eq!(seg.objects.len(), 2);
+        let a = seg.objects.iter().map(|o| o.area_mm2).fold(0.0, f64::max);
+        assert!(a > 20.0 * 20.0 * 0.95, "carré rempli : {a} mm²");
+
+        // Une gomme dans ce carré reste un trou même avec le remplissage.
+        let mut m = mask.clone();
+        apply_strokes(&mut m, w, h, ppm, &[stroke(true, 1.0, &carre), stroke(false, 3.0, &[[70.0, 50.0]])], true);
+        assert!(!m[(50.0 * ppm) as usize * w + (70.0 * ppm) as usize]);
+    }
 }

@@ -1,7 +1,7 @@
 //! Enchaînement des étapes avec mise en cache : on ne recalcule que ce qui a changé.
 
 use crate::mesh::{Plate, PlateParams, build_plate};
-use crate::vision::{self, Outline, P2, SegParams, Segmentation};
+use crate::vision::{self, BrushStroke, Outline, P2, SegParams, Segmentation};
 use image::RgbImage;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,13 +57,17 @@ pub struct Project {
     pub notches: Vec<P2>,
     /// Profondeurs propres à certains objets : (point sur l'objet en mm, profondeur en mm).
     pub depth_pts: Vec<(P2, f64)>,
+    /// Retouches manuelles du masque des objets, dans l'ordre (la dernière l'emporte).
+    pub strokes: Vec<BrushStroke>,
 
     pub rectified: Option<RgbImage>,
+    /// Masque des objets avant retouches (cache).
+    raw_mask: Option<Vec<bool>>,
     pub seg: Option<Segmentation>,
     pub excluded_labels: Vec<u32>,
     pub outline: Option<Outline>,
     pub plate: Option<Result<Plate, String>>,
-    keys: [String; 4],
+    keys: [String; 5],
 }
 
 impl Project {
@@ -86,7 +90,9 @@ impl Project {
             excluded_pts: Vec::new(),
             notches: Vec::new(),
             depth_pts: Vec::new(),
+            strokes: Vec::new(),
             rectified: None,
+            raw_mask: None,
             seg: None,
             excluded_labels: Vec::new(),
             outline: None,
@@ -106,8 +112,18 @@ impl Project {
         }
         let k1 = format!("{k0}{:?}", s.seg);
         if k1 != self.keys[1] || changed {
-            self.seg = Some(vision::segment(self.rectified.as_ref().unwrap(), s.ppm, &s.seg));
+            self.raw_mask = Some(vision::segment_mask(self.rectified.as_ref().unwrap(), s.ppm, &s.seg));
             self.keys[1] = k1.clone();
+            changed = true;
+        }
+        let k1 = format!("{k1}{:?}", self.strokes);
+        if k1 != self.keys[4] || changed {
+            let img = self.rectified.as_ref().unwrap();
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let mut mask = self.raw_mask.clone().unwrap();
+            vision::apply_strokes(&mut mask, w, h, s.ppm, &self.strokes, s.seg.fill_holes);
+            self.seg = Some(vision::label_objects(&mask, w, h, s.ppm, s.seg.min_area_mm2));
+            self.keys[4] = k1.clone();
             changed = true;
         }
         let k2 = format!(

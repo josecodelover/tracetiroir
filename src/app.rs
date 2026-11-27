@@ -3,7 +3,7 @@
 use crate::mesh::{self, PlateMode};
 use crate::pipeline::{PAPERS, Project, Settings};
 use crate::render3d;
-use crate::vision::P2;
+use crate::vision::{BrushStroke, P2};
 use eframe::egui::{
     self, Color32, ColorImage, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, TextStyle, TextureHandle,
     TextureOptions, Vec2,
@@ -97,6 +97,10 @@ const TIP_NOTCH_MODE: &str = "Clic gauche : ajoute une encoche de préhension à
 Clic droit : retire l'encoche la plus proche.";
 const TIP_EXCLUDE_MODE: &str = "Clic sur un objet : l'exclut du plateau (règle, tache prise pour \
 un objet…). Cliquez à nouveau pour le réintégrer.";
+const TIP_ADD_MODE: &str = "Peignez pour ajouter de la matière à un objet : bout manquant, \
+contour mal fermé, objet oublié. Un contour fermé tracé à la main est rempli.";
+const TIP_ERASE_MODE: &str = "Peignez pour retirer une zone prise à tort pour un objet : ombre, \
+reflet, tache, deux objets collés à séparer.";
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -109,6 +113,8 @@ enum Tab {
 enum ClickMode {
     Notch,
     Exclude,
+    Add,
+    Erase,
 }
 
 pub struct App {
@@ -131,6 +137,10 @@ pub struct App {
     pending_open: Option<std::path::PathBuf>,
     /// Objet survolé dans la liste des profondeurs (mis en évidence sur l'image).
     hover_obj: Option<u32>,
+    /// Diamètre du pinceau de retouche (mm).
+    brush_mm: f64,
+    /// Un trait de pinceau est en cours.
+    painting: bool,
 }
 
 impl App {
@@ -156,6 +166,8 @@ impl App {
             status: "Ouvrez une photo des objets posés sur une feuille blanche.".into(),
             pending_open: initial,
             hover_obj: None,
+            brush_mm: 4.0,
+            painting: false,
         }
     }
 
@@ -562,7 +574,12 @@ impl App {
             segmented(
                 ui,
                 &mut self.click,
-                &[(ClickMode::Notch, "◯  Ajouter une encoche", TIP_NOTCH_MODE), (ClickMode::Exclude, "⊘  Ignorer un objet", TIP_EXCLUDE_MODE)],
+                &[
+                    (ClickMode::Notch, "◯  Encoche", TIP_NOTCH_MODE),
+                    (ClickMode::Exclude, "⊘  Ignorer", TIP_EXCLUDE_MODE),
+                    (ClickMode::Add, "✚  Ajouter", TIP_ADD_MODE),
+                    (ClickMode::Erase, "━  Gommer", TIP_ERASE_MODE),
+                ],
             );
             ui.add_space(12.0);
             legend(ui, Color32::from_rgb(70, 130, 240), "objet");
@@ -574,15 +591,51 @@ impl App {
             RichText::new(match self.click {
                 ClickMode::Notch => "Cliquez au bord d'une empreinte pour y ajouter une encoche ; clic droit pour retirer la plus proche.",
                 ClickMode::Exclude => "Cliquez sur un objet pour l'ignorer ou le réintégrer.",
+                ClickMode::Add => "Peignez sur l'image pour compléter un objet (zone bleue). Ctrl+Z annule le dernier trait.",
+                ClickMode::Erase => "Peignez sur l'image pour retirer une zone détectée à tort. Ctrl+Z annule le dernier trait.",
             })
             .small()
             .color(MUTED),
         );
+        let brush = matches!(self.click, ClickMode::Add | ClickMode::Erase);
+        let mut strokes_changed = false;
+        if let Some(p) = self.project.as_mut() {
+            let n = p.strokes.len();
+            if brush {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Pinceau").color(MUTED));
+                    ui.add(egui::Slider::new(&mut self.brush_mm, 1.0..=30.0).suffix(" mm").logarithmic(true))
+                        .on_hover_text("Diamètre du pinceau, en mm sur la feuille.");
+                    ui.add_space(8.0);
+                    if ui.add_enabled(n > 0, egui::Button::new("↶  Annuler")).on_hover_text("Retire le dernier trait (Ctrl+Z).").clicked() {
+                        p.strokes.pop();
+                        strokes_changed = true;
+                    }
+                    if ui.add_enabled(n > 0, egui::Button::new("Tout effacer")).on_hover_text("Retire toutes les retouches à la main.").clicked() {
+                        p.strokes.clear();
+                        strokes_changed = true;
+                    }
+                    if n > 0 {
+                        ui.label(RichText::new(format!("{n} retouche(s)")).small().color(MUTED));
+                    }
+                });
+            } else if n > 0 {
+                hint(ui, &format!("{n} retouche(s) à la main : outils « Ajouter » / « Gommer » pour les modifier."));
+            }
+            if n > 0 && !self.painting && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+                p.strokes.pop();
+                strokes_changed = true;
+            }
+        }
+        if strokes_changed {
+            self.dirty = true;
+            self.last_change = Instant::now() - Duration::from_secs(1);
+        }
         ui.add_space(4.0);
         let (Some(p), Some(tex)) = (self.project.as_mut(), self.rect_tex.as_ref()) else { return };
         let ppm = self.applied.ppm;
         let [tw, th] = tex.size();
-        let (rect, resp) = fit_rect(ui, tw as f32, th as f32, Sense::click());
+        let (rect, resp) = fit_rect(ui, tw as f32, th as f32, Sense::click_and_drag());
         let sc = rect.width() / tw as f32 * ppm as f32; // pixels écran par mm
         let painter = ui.painter_at(rect);
         painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
@@ -630,6 +683,26 @@ impl App {
             painter.line_segment([c + Vec2::new(-d, -d) * 0.7, c + Vec2::new(d, d) * 0.7], Stroke::new(2.5, Color32::WHITE));
             painter.line_segment([c + Vec2::new(-d, d) * 0.7, c + Vec2::new(d, -d) * 0.7], Stroke::new(2.5, Color32::WHITE));
         }
+        // Trait en cours (ou pas encore recalculé) : affiché tel quel.
+        if self.painting || self.dirty {
+            if let Some(st) = p.strokes.last() {
+                let col = if st.add { Color32::from_rgba_unmultiplied(70, 200, 120, 120) } else { Color32::from_rgba_unmultiplied(235, 80, 80, 120) };
+                let r = st.radius_mm as f32 * sc;
+                let pts: Vec<Pos2> = st.pts.iter().map(|q| to_screen(*q)).collect();
+                for w in pts.windows(2) {
+                    painter.line_segment([w[0], w[1]], Stroke::new(2.0 * r, col));
+                }
+                for c in &pts {
+                    painter.circle_filled(*c, r, col);
+                }
+            }
+        }
+        if brush {
+            if let Some(h) = resp.hover_pos() {
+                let col = if self.click == ClickMode::Add { Color32::from_rgb(70, 200, 120) } else { Color32::from_rgb(235, 80, 80) };
+                painter.circle_stroke(h, (self.brush_mm * 0.5) as f32 * sc, Stroke::new(1.5, col));
+            }
+        }
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             if self.click == ClickMode::Notch {
@@ -639,11 +712,49 @@ impl App {
             }
         }
         let to_mm = |pos: Pos2| -> P2 { [((pos.x - rect.min.x) / sc) as f64, ((pos.y - rect.min.y) / sc) as f64] };
-        if resp.clicked() {
+        let mut changed = false;
+        if brush {
+            let add = self.click == ClickMode::Add;
+            let radius_mm = self.brush_mm * 0.5;
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                let start = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+                if let Some(pos) = start {
+                    p.strokes.push(BrushStroke { add, radius_mm, pts: vec![to_mm(pos)] });
+                    self.painting = true;
+                }
+            }
+            if self.painting {
+                if let (Some(pos), Some(st)) = (resp.interact_pointer_pos(), p.strokes.last_mut()) {
+                    let q = to_mm(pos);
+                    let last = *st.pts.last().unwrap();
+                    if (q[0] - last[0]).hypot(q[1] - last[1]) > (st.radius_mm * 0.3).max(0.2) {
+                        st.pts.push(q);
+                    }
+                }
+                if resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+                    self.painting = false;
+                    changed = true;
+                }
+            } else if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    p.strokes.push(BrushStroke { add, radius_mm, pts: vec![to_mm(pos)] });
+                    changed = true;
+                }
+            }
+            if resp.hovered() || self.painting {
+                ui.ctx().request_repaint();
+            }
+        }
+        if changed {
+            self.dirty = true;
+            self.last_change = Instant::now() - Duration::from_secs(1);
+        }
+        if !brush && resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let q = to_mm(pos);
                 match self.click {
                     ClickMode::Notch => p.notches.push(q),
+                    ClickMode::Add | ClickMode::Erase => {}
                     ClickMode::Exclude => {
                         if let Some(l) = p.label_at(q, ppm) {
                             let before = p.excluded_pts.len();
@@ -660,7 +771,7 @@ impl App {
                 self.last_change = Instant::now() - Duration::from_secs(1);
             }
         }
-        if resp.secondary_clicked() {
+        if self.click == ClickMode::Notch && resp.secondary_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let q = to_mm(pos);
                 let near = p
@@ -1010,7 +1121,7 @@ impl eframe::App for App {
                         &mut self.tab,
                         &[
                             (Tab::Photo, "①  Photo & feuille", "Vérifiez et ajustez les 4 coins de la feuille."),
-                            (Tab::Contours, "②  Contours", "Contrôlez les objets détectés, placez les encoches, ignorez des objets."),
+                            (Tab::Contours, "②  Contours", "Contrôlez les objets détectés, placez les encoches, ignorez des objets, corrigez-les au pinceau."),
                             (Tab::Vue3D, "③  Aperçu 3D", "Visualisez le plateau qui sera exporté."),
                         ],
                     );
